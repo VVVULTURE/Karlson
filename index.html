@@ -4,85 +4,168 @@
   <meta charset="utf-8">
   <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
   <title>Unity WebGL Player | Karlson</title>
-  <script src="Build/UnityLoader.js"></script>
   <style>
-    * {
-      margin: 0;
-      padding: 0;
-      border: 0;
-      overflow: hidden;
-    }
-    body {
-      background: #000;
-      position: fixed;
-      width: 100%;
-      height: 100%;
-    }
-    #unityContainer {
-      position: absolute;
-      width: 100%;
-      height: 100%;
+    * { margin: 0; padding: 0; border: 0; overflow: hidden; }
+    body { background: #000; position: fixed; width: 100%; height: 100%; }
+    #unityContainer { position: absolute; width: 100%; height: 100%; }
+    #loading-text {
+      color: white; font-size: 48px; font-family: cursive;
+      text-align: center; margin-top: 20px;
     }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
   <script>
-    // CDN base for files not hosted in this repo
+    // CDN base — data + framework are too large for Vercel, served from jsDelivr
     const CDN = "https://cdn.jsdelivr.net/gh/genizy/web-port@main/karlson/Build/";
 
-    function resizeUnityContainer() {
-      var container = document.getElementById("unityContainer");
-      container.style.width = window.innerWidth + "px";
-      container.style.height = window.innerHeight + "px";
-    }
+    // Sentinel URL passed to UnityLoader for the wasm file.
+    // Must end in ".unityweb" so UnityLoader schedules it as a wasm download.
+    // Our XHR patch intercepts this specific URL and returns pre-extracted bytes.
+    const WASM_SENTINEL = "Build/tyj.wasm.code.unityweb";
 
-    async function loadZip(url) {
-      const response = await fetch(url);
-      if (!response.ok) throw new Error("Failed to fetch zip: " + url + " status " + response.status);
-      const arrayBuffer = await response.arrayBuffer();
+    // Populated before UnityLoader runs
+    let wasmBytes = null;
 
-      const jszip = new JSZip();
-      const zip = await jszip.loadAsync(arrayBuffer);
+    // ── XHR monkey-patch ─────────────────────────────────────────────────────
+    // UnityLoader uses plain XHR to fetch every build asset.
+    // We intercept any request for our sentinel URL and respond with the
+    // pre-extracted wasm Uint8Array, bypassing any network fetch.
+    (function patchXHR() {
+      const RealXHR = window.XMLHttpRequest;
 
-      if (zip.files["tyj.wasm.code.unityweb"]) {
-        // Must use application/wasm so WebAssembly streaming compile works
-        const content = await zip.file("tyj.wasm.code.unityweb").async("uint8array");
-        const blob = new Blob([content], { type: "application/wasm" });
-        return URL.createObjectURL(blob);
+      function PatchedXHR() {
+        const real = new RealXHR();
+        let _intercepting = false;
+
+        // Mirror all real XHR properties onto this wrapper
+        const wrap = this;
+
+        // Properties UnityLoader reads
+        const passthrough = [
+          "responseType","withCredentials","timeout",
+          "upload","onprogress","onload","onerror","onabort",
+          "ontimeout","onreadystatechange","onloadend"
+        ];
+        passthrough.forEach(p => {
+          Object.defineProperty(wrap, p, {
+            get: () => real[p],
+            set: v  => { real[p] = v; },
+            configurable: true
+          });
+        });
+
+        const readonly = ["readyState","status","statusText","response","responseText"];
+        readonly.forEach(p => {
+          Object.defineProperty(wrap, p, {
+            get: () => real[p],
+            configurable: true
+          });
+        });
+
+        wrap.open = function(method, url, async, user, pass) {
+          if (typeof url === "string" && url.includes("tyj.wasm.code.unityweb")) {
+            _intercepting = true;
+            return; // don't call real.open
+          }
+          return real.open(method, url, async !== false, user, pass);
+        };
+
+        wrap.setRequestHeader = function(h, v) {
+          if (_intercepting) return;
+          real.setRequestHeader(h, v);
+        };
+
+        wrap.send = function(body) {
+          if (!_intercepting) return real.send(body);
+
+          // Synthesize a successful response with our pre-extracted wasm bytes
+          setTimeout(function() {
+            // Override readonly props with our fake values
+            Object.defineProperty(wrap, "readyState", { get: () => 4, configurable: true });
+            Object.defineProperty(wrap, "status",     { get: () => 200, configurable: true });
+            Object.defineProperty(wrap, "response",   { get: () => wasmBytes.buffer, configurable: true });
+
+            if (typeof wrap.onload === "function")
+              wrap.onload({ target: wrap, type: "load" });
+            if (typeof wrap.onreadystatechange === "function")
+              wrap.onreadystatechange();
+            if (typeof wrap.onloadend === "function")
+              wrap.onloadend({ target: wrap, type: "loadend" });
+          }, 0);
+        };
+
+        wrap.abort = function() { if (!_intercepting) real.abort(); };
+        wrap.addEventListener = function(ev, fn) { real.addEventListener(ev, fn); };
+        wrap.removeEventListener = function(ev, fn) { real.removeEventListener(ev, fn); };
       }
 
-      throw new Error("tyj.wasm.code.unityweb not found in zip: " + url);
+      PatchedXHR.prototype = RealXHR.prototype;
+      window.XMLHttpRequest = PatchedXHR;
+    })();
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function resizeUnityContainer() {
+      const c = document.getElementById("unityContainer");
+      c.style.width  = window.innerWidth  + "px";
+      c.style.height = window.innerHeight + "px";
+    }
+
+    async function extractWasm() {
+      const res = await fetch("Build/tyj.wasm.code.unityweb.zip");
+      if (!res.ok) throw new Error("Zip fetch failed: " + res.status);
+      const buf = await res.arrayBuffer();
+      const zip = await JSZip.loadAsync(buf);
+      if (!zip.files["tyj.wasm.code.unityweb"])
+        throw new Error("tyj.wasm.code.unityweb not found inside zip");
+      wasmBytes = await zip.file("tyj.wasm.code.unityweb").async("uint8array");
     }
 
     async function startUnity() {
-      // Extract wasm from the locally-hosted zip, with correct MIME type
-      const wasmurl = await loadZip("Build/tyj.wasm.code.unityweb.zip");
+      // Step 1: extract wasm from zip BEFORE UnityLoader is loaded
+      await extractWasm();
 
-      // Unity 2019 UnityLoader config — all URLs must be absolute or
-      // relative to the page, NOT to a blob. Data + framework come from CDN.
+      // Step 2: build the Unity 2019 config object
       const config = {
-        companyName: "Dani",
-        productName: "Karlson",
+        companyName:    "Dani",
+        productName:    "Karlson",
         productVersion: "0.1",
-        dataUrl: CDN + "tyj.data.unityweb",
-        wasmCodeUrl: wasmurl,
-        wasmFrameworkUrl: CDN + "tyj.wasm.framework.js",
-        graphicsAPI: ["WebGL 2.0"],
+        dataUrl:           CDN + "tyj.data.unityweb",
+        wasmCodeUrl:       WASM_SENTINEL,   // intercepted by XHR patch
+        wasmFrameworkUrl:  CDN + "tyj.wasm.framework.js",
+        graphicsAPI:       ["WebGL 2.0"],
         webglContextAttributes: { preserveDrawingBuffer: false },
         splashScreenStyle: "Dark",
-        backgroundColor: "#231F20",
-        developmentBuild: false,
-        multithreading: false,
-        unityVersion: "2019.2.6f1"
+        backgroundColor:   "#231F20",
+        developmentBuild:  false,
+        multithreading:    false,
+        unityVersion:      "2019.2.6f1"
       };
+
+      // Step 3: UnityLoader.instantiate() REQUIRES a URL string as 2nd argument
+      //         (it fetches it and JSON.parses the response). Serve config as blob.
+      const configUrl = URL.createObjectURL(
+        new Blob([JSON.stringify(config)], { type: "application/json" })
+      );
 
       window.addEventListener("resize", resizeUnityContainer);
       resizeUnityContainer();
 
-      UnityLoader.instantiate("unityContainer", config, {
+      // Step 4: load UnityLoader.js AFTER XHR patch is in place
+      await new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = "Build/UnityLoader.js";
+        s.onload = resolve;
+        s.onerror = () => reject(new Error("Failed to load UnityLoader.js"));
+        document.head.appendChild(s);
+      });
+
+      // Step 5: instantiate — 2nd arg is the config blob URL
+      UnityLoader.instantiate("unityContainer", configUrl, {
+        onProgress: UnityLoader.Progress.handler,
         Module: {
           onRuntimeInitialized: function () {
-            var loadingText = document.querySelector("#loading-text");
-            if (loadingText) loadingText.remove();
+            const el = document.getElementById("loading-text");
+            if (el) el.remove();
           }
         }
       });
@@ -92,18 +175,7 @@
   </script>
 </head>
 <body>
-  <div
-    id="loading-text"
-    style="
-      color: white;
-      font-size: 48px;
-      font-family: cursive;
-      text-align: center;
-      margin-top: 20px;
-    "
-  >
-    LOADING...
-  </div>
+  <div id="loading-text">LOADING...</div>
   <div id="unityContainer"></div>
 </body>
 </html>
